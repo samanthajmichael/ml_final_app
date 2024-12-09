@@ -9,6 +9,8 @@ from huggingface_hub import login
 import tensorflow as tf
 from tensorflow.keras.layers import Input, Conv2D, MaxPooling2D, Flatten, Dense, Lambda
 from tensorflow.keras.models import Model
+from moviepy.editor import VideoFileClip, concatenate_videoclips
+from tensorflow.keras.preprocessing.image import img_to_array, load_img
 from yt_dlp import YoutubeDL
 
 # Initialize session state for selected indices
@@ -21,15 +23,15 @@ login(token=token)
 
 def build_base_network(input_shape):
     """Create base CNN for feature extraction"""
-    inputs = Input(shape=input_shape)
-    x = Conv2D(32, (3, 3), activation='relu', padding='same')(inputs)
-    x = MaxPooling2D((2, 2))(x)
-    x = Conv2D(64, (3, 3), activation='relu', padding='same')(x)
-    x = MaxPooling2D((2, 2))(x)
-    x = Conv2D(128, (3, 3), activation='relu', padding='same')(x)
-    x = MaxPooling2D((2, 2))(x)
-    x = Flatten()(x)
-    x = Dense(128, activation='relu')(x)
+    inputs = tf.keras.layers.Input(shape=input_shape)
+    x = tf.keras.layers.Conv2D(32, (3, 3), activation='relu', padding='same')(inputs)
+    x = tf.keras.layers.MaxPooling2D((2, 2))(x)
+    x = tf.keras.layers.Conv2D(64, (3, 3), activation='relu', padding='same')(x)
+    x = tf.keras.layers.MaxPooling2D((2, 2))(x)
+    x = tf.keras.layers.Conv2D(128, (3, 3), activation='relu', padding='same')(x)
+    x = tf.keras.layers.MaxPooling2D((2, 2))(x)
+    x = tf.keras.layers.Flatten()(x)
+    x = tf.keras.layers.Dense(128, activation='relu')(x)
     return x
 
 def get_youtube_stream_url(video_id):
@@ -39,53 +41,17 @@ def get_youtube_stream_url(video_id):
         return info['url']
 
 def extract_frames_from_stream(video_url, interval=1):
-    cap = cv2.VideoCapture(video_url)
-    if not cap.isOpened():
-        raise Exception("Failed to open video stream")
-    
-    frame_rate = cap.get(cv2.CAP_PROP_FPS)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    frames = []
-    frame_indices = []
-    frame_count = 0
-    
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if frame_count % (int(frame_rate) * interval) == 0:
-            frames.append(frame)
-            frame_indices.append(frame_count)
-        frame_count += 1
-    
-    cap.release()
-    return frames, frame_indices, frame_rate, total_frames
+    clip = VideoFileClip(video_url)
+    frames = [frame for frame in clip.iter_frames(fps=clip.fps)]
+    frame_indices = [i for i in range(0, len(frames), int(clip.fps * interval))]
+    return frames, frame_indices, clip.fps, len(frames)
 
 def get_context_frames(video_url, frame_index, context_seconds=5, fps=30):
-    context_frames = []
-    cap = cv2.VideoCapture(video_url)
-    
-    if not cap.isOpened():
-        raise Exception("Failed to open video stream")
-    
-    # Calculate start and end frames
-    start_frame = max(0, frame_index - int(fps * context_seconds))
-    end_frame = min(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), 
-                   frame_index + int(fps * context_seconds))
-    
-    # Set video to start frame
-    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-    
-    # Read frames
-    frame_count = start_frame
-    while cap.isOpened() and frame_count <= end_frame:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        context_frames.append(frame)
-        frame_count += 1
-    
-    cap.release()
+    clip = VideoFileClip(video_url)
+    start_time = max(0, frame_index / fps - context_seconds)
+    end_time = min(clip.duration, frame_index / fps + context_seconds)
+    context_clip = clip.subclip(start_time, end_time)
+    context_frames = [frame for frame in context_clip.iter_frames()]
     return context_frames
 
 def find_similar_frames(reference_image, candidate_frames, top_n=5):
@@ -106,64 +72,28 @@ def create_video_from_frames(frames, output_path, fps=30):
     if not frames:
         raise ValueError("No frames provided for video creation")
     
-    height, width, layers = frames[0].shape
-    
-    # Define a list of codecs to try, in order of preference
-    codec_options = [
-        ('XVID', '.avi'),  # XVID codec with AVI container
-        ('MJPG', '.avi'),  # Motion JPEG with AVI container
-        ('mp4v', '.mp4'),  # MPEG-4 with MP4 container
-        ('X264', '.mp4'),  # H.264 with MP4 container
-        ('DIV3', '.avi'),  # DivX3 with AVI container
-    ]
-    
-    last_error = None
-    for codec, extension in codec_options:
-        try:
-            # Update output path with correct extension
-            current_output = os.path.splitext(output_path)[0] + extension
-            
-            # Create VideoWriter object
-            fourcc = cv2.VideoWriter_fourcc(*codec)
-            out = cv2.VideoWriter(current_output, fourcc, fps, (width, height))
-            
-            if out.isOpened():
-                for frame in frames:
-                    out.write(frame)
-                out.release()
-                
-                # If we successfully wrote the video, read it back to verify
-                with open(current_output, 'rb') as f:
-                    video_bytes = f.read()
-                    if len(video_bytes) > 0:
-                        return current_output, video_bytes
-        except Exception as e:
-            last_error = str(e)
-            continue
-        finally:
-            if 'out' in locals():
-                out.release()
-    
-    raise Exception(f"Failed to create video with any available codec. Last error: {last_error}")
+    clips = [VideoFileClip(f'memory://{i}').set_duration(1/fps) for i, frame in enumerate(frames)]
+    final_clip = concatenate_videoclips(clips)
+    final_clip.write_videofile(output_path, fps=fps)
 
 try:
     input_shape = (224, 224, 3)
     
     # Create inputs
-    input_a = Input(shape=input_shape)
-    input_b = Input(shape=input_shape)
+    input_a = tf.keras.layers.Input(shape=input_shape)
+    input_b = tf.keras.layers.Input(shape=input_shape)
     
     # Share base network weights for both inputs
     tower = tf.keras.models.Sequential([
-        Input(shape=input_shape),
-        Conv2D(32, (3, 3), activation='relu', padding='same'),
-        MaxPooling2D((2, 2)),
-        Conv2D(64, (3, 3), activation='relu', padding='same'),
-        MaxPooling2D((2, 2)),
-        Conv2D(128, (3, 3), activation='relu', padding='same'),
-        MaxPooling2D((2, 2)),
-        Flatten(),
-        Dense(128, activation='relu')
+        tf.keras.layers.Input(shape=input_shape),
+        tf.keras.layers.Conv2D(32, (3, 3), activation='relu', padding='same'),
+        tf.keras.layers.MaxPooling2D((2, 2)),
+        tf.keras.layers.Conv2D(64, (3, 3), activation='relu', padding='same'),
+        tf.keras.layers.MaxPooling2D((2, 2)),
+        tf.keras.layers.Conv2D(128, (3, 3), activation='relu', padding='same'),
+        tf.keras.layers.MaxPooling2D((2, 2)),
+        tf.keras.layers.Flatten(),
+        tf.keras.layers.Dense(128, activation='relu')
     ])
     
     # Get embeddings
@@ -171,13 +101,13 @@ try:
     embedding_b = tower(input_b)
     
     # Compute absolute difference between embeddings
-    distance = Lambda(lambda x: tf.math.abs(x[0] - x[1]))([embedding_a, embedding_b])
+    distance = tf.keras.layers.Lambda(lambda x: tf.math.abs(x[0] - x[1]))([embedding_a, embedding_b])
     
     # Add prediction layer
-    output = Dense(1, activation='sigmoid')(distance)
+    output = tf.keras.layers.Dense(1, activation='sigmoid')(distance)
     
     # Create model
-    siamese_model = Model(inputs=[input_a, input_b], outputs=output)
+    siamese_model = tf.keras.models.Model(inputs=[input_a, input_b], outputs=output)
     
     # Compile model
     siamese_model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
@@ -195,27 +125,21 @@ try:
     # Streamlit app
     st.title("Match Cutting with YouTube")
 
-    # Move YouTube ID input to sidebar
-    with st.sidebar:
-        st.header("Input Video")
-        video_id = st.text_input(
-            "Enter YouTube Video ID",
-            help="Found in the URL after 'v='. Video must be under 10 minutes."
-        )
-
     # Create two columns for layout
     col1, col2 = st.columns(2)
 
-    frames = []
-    stream_url = None
-
-    if video_id:
-        with st.spinner("Processing YouTube video..."):
-            stream_url = get_youtube_stream_url(video_id)
-            frames, frame_indices, frame_rate, total_frames = extract_frames_from_stream(stream_url)
-            st.sidebar.success(f"Extracted {len(frames)} frames from the video.")
-
     with col1:
+        # Input for YouTube Video ID
+        video_id = st.text_input("Enter YouTube Video ID (Found in the URL (after 'v=') Video must be under 10 minutes):")
+        frames = []
+        stream_url = None
+
+        if video_id:
+            with st.spinner("Processing YouTube video..."):
+                stream_url = get_youtube_stream_url(video_id)
+                frames, frame_indices, frame_rate, total_frames = extract_frames_from_stream(stream_url)
+                st.write(f"Extracted {len(frames)} frames from the video.")
+
         # Select and display a frame
         if frames:
             st.write("Select a frame to use as the reference:")
@@ -250,6 +174,7 @@ try:
             if st.button("Create Video from Selected Frames"):
                 with st.spinner("Creating video..."):
                     try:
+                        # Create temporary directory with a specific name
                         temp_dir = tempfile.mkdtemp()
                         temp_file = os.path.join(temp_dir, 'output.mp4')
                         
@@ -261,8 +186,12 @@ try:
                             all_context_frames.extend(context_frames)
                         
                         if all_context_frames:
-                            # Create video file with new function
-                            output_path, video_bytes = create_video_from_frames(all_context_frames, temp_file, fps=frame_rate)
+                            # Create video file
+                            create_video_from_frames(all_context_frames, temp_file, fps=frame_rate)
+                            
+                            # Read and display the video
+                            with open(temp_file, 'rb') as video_file:
+                                video_bytes = video_file.read()
                             
                             if len(video_bytes) > 0:
                                 st.video(video_bytes)
@@ -270,8 +199,8 @@ try:
                                 st.download_button(
                                     label="Download Video",
                                     data=video_bytes,
-                                    file_name=os.path.basename(output_path),
-                                    mime="video/mp4" if output_path.endswith('.mp4') else "video/avi"
+                                    file_name="match_cut.mp4",
+                                    mime="video/mp4"
                                 )
                             else:
                                 st.error("Generated video file is empty")
@@ -285,10 +214,6 @@ try:
                         try:
                             if os.path.exists(temp_file):
                                 os.remove(temp_file)
-                            for ext in ['.mp4', '.avi']:
-                                possible_file = os.path.splitext(temp_file)[0] + ext
-                                if os.path.exists(possible_file):
-                                    os.remove(possible_file)
                             os.rmdir(temp_dir)
                         except Exception as e:
                             st.warning(f"Failed to clean up temporary files: {str(e)}")
